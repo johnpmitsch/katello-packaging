@@ -135,13 +135,6 @@ def valid_fpc_standard_backup
   !(@pgsql_data_exists || @candlepin_dump_exists || @foreman_dump_exists || @mongo_dump_exists)
 end
 
-def backup_invalid_message
-  puts "There are too many files in the backup directory, please check only the " \
-       "required files are present."
-  display_backup_options
-  exit(-1)
-end
-
 def restore_databases
   puts "Logical backup detected, using the standard backup files to restore" if valid_logical_backup
   if @pulp_data_exists
@@ -218,7 +211,7 @@ def backup_valid?
   @config_exists = File.exist?(File.join(@dir, 'config_files.tar.gz'))
 
   unless @config_exists
-    puts "Cannot find the required config_file.tar.gz file in #{@dir}"
+    puts "Cannot find the required config_files.tar.gz file in #{@dir}"
     exit(-1)
   end
 
@@ -231,11 +224,11 @@ def backup_valid?
 
   if @foreman_proxy_content
     unless valid_fpc_standard_backup || valid_fpc_online_backup
-      backup_invalid_message
+      display_backup_options
     end
   else
     unless valid_standard_backup || valid_online_backup
-      backup_invalid_message
+      display_backup_options
     end
   end
   true
