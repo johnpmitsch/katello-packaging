@@ -5,6 +5,7 @@ require "yaml"
 require "shellwords"
 require "json"
 require "uri"
+require "fileutils"
 require_relative "helper.rb"
 
 module KatelloUtilities
@@ -25,7 +26,45 @@ module KatelloUtilities
       @options[:scenario] = init_options.fetch(:scenario, @last_scenario)
       @foreman_proxy_content = @options[:scenario] == @proxy_hyphenated
 
+      @last_scenario_path = "/etc/foreman-installer/scenarios.d/last_scenario.yaml"
+      @last_scenario_backup_path = "/etc/foreman-installer/scenarios.d/last_scenario.yaml.kchbackup"
+
+      @scenarios_location = "/etc/foreman-installer/scenarios.d/"
+
       setup_opt_parser
+    end
+
+    def cleanup(exitstatus=-1)
+      # Don't use run_cmd method in this cleanup method. It can create an infinite loop
+      # since run_cmd calls cleanup
+      if @options[:skip_cleanup]
+        STDOUT.puts "Skipping cleanup"
+        return false
+      end
+
+      STDOUT.puts "Cleaning up..."
+      STDOUT.puts "Reverting system hostname back to original hostname"
+      if self.get_hostname == @new_hostname
+        self.update_system_hostname(@new_hostname, @old_hostname)
+      end
+
+      STDOUT.puts "Restoring HOSTNAME environment variable"
+      ENV['HOSTNAME'] = @new_hostname
+
+      STDOUT.puts "re-running the installer to recreate deleted certs"
+      self.run_installer(true)
+
+      STDOUT.puts "ensuring any stopped services are started"
+      `katello-service start`
+
+      STDOUT.puts "Change default proxy name back to #{@old_hostname}"
+      self.update_default_proxy(@new_hostname, @old_hostname) 
+
+      STDOUT.puts "Change installation media paths back to #{@old_hostname}"
+      self.update_installation_media_paths(@new_hostname, @old_hostname)
+
+      STDOUT.puts "Cleanup done. Exiting script."
+      exit(exitstatus)
     end
 
     def get_default_program
@@ -146,7 +185,8 @@ module KatelloUtilities
 
   Short hostnames have not been updated, please update those manually.\n
     )
-      STDOUT.puts "**** Hostname change complete! **** \nIMPORTANT:"
+      STDOUT.puts "**** Hostname change completed successfully! ****".green
+      STDOUT.puts "IMPORTANT: \n"
       if @foreman_proxy_content
         STDOUT.print "You will have to update the Name and URL of the Smart Proxy in #{@options[:program].capitalize} to the new hostname.\n"
       else
@@ -171,11 +211,77 @@ module KatelloUtilities
       run_cmd("hammer -u #{@options[:username].shellescape} -p #{@options[:password].shellescape} #{cmd}", exit_codes, message)
     end
 
-    def get_default_proxy_id
-      output = hammer_cmd("--output json capsule info --name #{@old_hostname}",
+    def get_default_proxy_id(hostname)
+      output = hammer_cmd("--output json capsule info --name #{hostname}",
                           [0], "Couldn't find default #{@proxy} id")
       proxy = JSON.parse(output)
-      proxy["Id"]
+      proxy.key?("Id") ? proxy["Id"] : nil
+    end
+
+    def update_default_proxy(old, new)
+      unless @foreman_proxy_content
+        STDOUT.puts "\nUpdating default #{@proxy}"
+        proxy_id = self.get_default_proxy_id(old)
+        if proxy_id
+          # Incorrect error message is piped to /dev/null, can be removed when http://projects.theforeman.org/issues/18186 is fixed
+          # For the same reason, we accept exit code 65 here.
+          self.hammer_cmd("capsule update --id #{proxy_id} --url https://#{old}:9090 --new-name #{new} 2> /dev/null", [0, 65])
+        end
+      end
+    end
+
+    def update_installation_media_paths(old, new)
+      unless @foreman_proxy_content
+        STDOUT.puts "Updating installation media paths"
+        old_media = JSON.parse(hammer_cmd("--output json medium list --search 'path ~ //#{old}/'"))
+        old_media.each do |medium|
+          new_path = URI.parse(medium['Path'])
+          new_path.host = new
+          new_path = new_path.to_s
+          hammer_cmd("medium update --id #{medium['Id']} --path #{new_path}")
+        end
+      end
+    end
+
+    def run_installer(rerun = false)
+      installer = "#{@options[:program]}-installer --scenario #{@options[:scenario]}"
+
+      # Always disable system checks to avoid unnecessary errors. Since this is run on an existing system
+      # system, installer checks would have already been deliberately skipped on initial install. 
+      installer << " --disable-system-checks" if disable_system_check_option?
+
+      unless rerun
+        installer << " -v"
+        if @foreman_proxy_content
+          installer << fpc_installer_args
+        else
+          installer << " --certs-regenerate=true --foreman-proxy-register-in-foreman true"
+        end
+      end
+
+      STDOUT.puts installer
+      if rerun
+        # using backticks here since this will be called in cleanup method
+        installer_output = `#{installer}`
+      else
+        installer_output = self.run_cmd("#{installer}")
+      end
+      installer_success = $?.success?
+      STDOUT.puts installer_output
+    end
+
+    def update_system_hostname(old_hostname, new_hostname)
+      STDOUT.puts "updating hostname in /etc/hostname"
+      self.run_cmd("sed -i -e 's/#{old_hostname}/#{new_hostname}/g' /etc/hostname")
+
+      STDOUT.puts "setting hostname"
+      self.run_cmd("hostnamectl set-hostname #{new_hostname}")
+
+      STDOUT.puts "updating hostname in /etc/hosts"
+      self.run_cmd("sed -i -e 's/#{old_hostname}/#{new_hostname}/g' /etc/hosts")
+
+      STDOUT.puts "updating hostname in foreman installer scenarios"
+      self.run_cmd("sed -i -e 's/#{old_hostname}/#{new_hostname}/g' /etc/foreman-installer/scenarios.d/*.yaml")
     end
 
     def setup_opt_parser
@@ -205,6 +311,10 @@ module KatelloUtilities
 
         opt.on("-y", "--assumeyes", "answer yes for all questions") do |confirm|
           @options[:confirm] = confirm
+        end
+
+        opt.on("-k", "--skip-cleanup", "skip cleanup steps on failure") do |skip_cleanup|
+          @options[:skip_cleanup] = skip_cleanup
         end
 
         if @foreman_proxy_content
@@ -238,27 +348,10 @@ module KatelloUtilities
 
       scenario_answers = load_scenario_answers(@options[:scenario])
 
-      unless @foreman_proxy_content
-        STDOUT.puts "\nUpdating default #{@proxy}"
-        proxy_id = self.get_default_proxy_id
-        # Incorrect error message is piped to /dev/null, can be removed when http://projects.theforeman.org/issues/18186 is fixed
-        # For the same reason, we accept exit code 65 here.
-        self.hammer_cmd("capsule update --id #{proxy_id} --url https://#{@new_hostname}:9090 --new-name #{@new_hostname} 2> /dev/null", [0, 65])
+      self.update_default_proxy(@old_hostname, @new_hostname) 
+      self.update_installation_media_paths(@old_hostname, @new_hostname)
 
-        STDOUT.puts "Updating installation media paths"
-        old_media = JSON.parse(hammer_cmd("--output json medium list --search 'path ~ //#{@old_hostname}/'"))
-        old_media.each do |medium|
-          new_path = URI.parse(medium['Path'])
-          new_path.host = @new_hostname
-          new_path = new_path.to_s
-          hammer_cmd("medium update --id #{medium['Id']} --path #{new_path}")
-        end
-      end
-
-      STDOUT.puts "updating hostname in /etc/hostname"
-      self.run_cmd("sed -i -e 's/#{@old_hostname}/#{@new_hostname}/g' /etc/hostname")
-      STDOUT.puts "setting hostname"
-      self.run_cmd("hostnamectl set-hostname #{@new_hostname}")
+      self.update_system_hostname(@old_hostname, @new_hostname)
 
       # override environment variable (won't be updated until bash login)
       ENV['HOSTNAME'] = @new_hostname
@@ -266,6 +359,7 @@ module KatelloUtilities
       STDOUT.puts "checking if hostname was changed"
       if self.get_hostname != @new_hostname
         self.fail_with_message("The new hostname was not changed successfully, exiting script")
+        self.cleanup
       end
 
       STDOUT.puts "stopping services"
@@ -273,6 +367,9 @@ module KatelloUtilities
 
       public_dir = "/var/www/html/pub"
       public_backup_dir = "#{public_dir}/#{@old_hostname}-#{self.timestamp}.backup"
+
+#      run_cmd("tar --selinux --create --gzip --file=#{File.join(@dir, 'config_files.tar.gz')}#{configure_configs.join(' ')} 2>/dev/null", [0,2])
+
       STDOUT.puts "deleting old certs"
 
       self.run_cmd("rm -rf /etc/pki/katello-certs-tools{,.bak}")
@@ -294,32 +391,11 @@ module KatelloUtilities
       end
 
       STDOUT.puts "backed up #{public_dir} to #{public_backup_dir}"
-      STDOUT.puts "updating hostname in /etc/hosts"
-      self.run_cmd("sed -i -e 's/#{@old_hostname}/#{@new_hostname}/g' /etc/hosts")
-
-      STDOUT.puts "updating hostname in foreman installer scenarios"
-      self.run_cmd("sed -i -e 's/#{@old_hostname}/#{@new_hostname}/g' /etc/foreman-installer/scenarios.d/*.yaml")
-
-      STDOUT.puts "removing last_scenario.yml file"
-      self.run_cmd("rm -rf /etc/foreman-installer/scenarios.d/last_scenario.yaml")
+      STDOUT.puts "moving last_scenario.yml file"
+      self.run_cmd("mv #{@last_scenario_path} #{@last_scenario_backup_path}")
 
       STDOUT.puts "re-running the installer"
-
-      installer = "#{@options[:program]}-installer --scenario #{@options[:scenario]} -v"
-      if @foreman_proxy_content
-        installer << fpc_installer_args
-      else
-        installer << " --certs-regenerate=true --foreman-proxy-register-in-foreman true"
-      end
-      # always disable system checks to avoid unnecessary errors. The installer should have
-      # already ran since this is to be run on an existing system and installer checks would
-      # have already been skipped
-      installer << " --disable-system-checks" if disable_system_check_option?
-
-      STDOUT.puts installer
-      installer_output = self.run_cmd("#{installer}")
-      installer_success = $?.success?
-      STDOUT.puts installer_output
+      self.run_installer
 
       STDOUT.puts "Restarting puppet services"
       self.run_cmd("/sbin/service puppet restart")
@@ -328,7 +404,9 @@ module KatelloUtilities
       if installer_success
         self.successful_hostname_change_message
       else
-        self.fail_with_message("Something went wrong with the #{@options[:scenario].capitalize} installer! Please check the above output and the corresponding logs")
+        self.fail_with_message("Something went wrong with the #{@options[:scenario].capitalize} installer! " \
+                               "Please check the above output and corresponding logs. You can fix what went wrong " \
+                               "and re-run the installer to complete the hostname change.")
       end
     end
   end
