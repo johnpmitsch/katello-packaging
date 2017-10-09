@@ -5,6 +5,7 @@ require "yaml"
 require "shellwords"
 require "json"
 require "uri"
+require "fileutils"
 require_relative "helper.rb"
 
 module KatelloUtilities
@@ -25,7 +26,26 @@ module KatelloUtilities
       @options[:scenario] = init_options.fetch(:scenario, @last_scenario)
       @foreman_proxy_content = @options[:scenario] == @proxy_hyphenated
 
+      @scenarios_location = "/etc/foreman-installer/scenarios.d/"
+
       setup_opt_parser
+    end
+
+    def cleanup(exitstatus=-1)
+      STDOUT.puts "Cleaning up..."
+      STDOUT.puts "Reverting system hostname back to original hostname"
+      if self.get_hostname == @new_hostname
+        self.update_system_hostname(@new_hostname, @old_hostname)
+      end
+
+      STDOUT.puts "Restoring last_scenario.yaml symlink"
+      last_scenario = @scenarios_location + "last_scenario.yaml"
+      unless File.exist? last_scenario
+        FileUtils.ln_s(@scenarios_location + "#{@last_scenario}.yaml", last_scenario)
+      end
+
+      STDOUT.puts "Done"
+      exit(exitstatus)
     end
 
     def get_default_program
@@ -146,7 +166,8 @@ module KatelloUtilities
 
   Short hostnames have not been updated, please update those manually.\n
     )
-      STDOUT.puts "**** Hostname change complete! **** \nIMPORTANT:"
+      STDOUT.puts "**** Hostname change completed successfully! ****".green
+      STDOUT.puts "IMPORTANT: \n"
       if @foreman_proxy_content
         STDOUT.print "You will have to update the Name and URL of the Smart Proxy in #{@options[:program].capitalize} to the new hostname.\n"
       else
@@ -223,6 +244,20 @@ module KatelloUtilities
       @opt_parser.parse!
     end
 
+    def update_system_hostname(old_hostname, new_hostname)
+      STDOUT.puts "updating hostname in /etc/hostname"
+      self.run_cmd("sed -i -e 's/#{old_hostname}/#{new_hostname}/g' /etc/hostname")
+
+      STDOUT.puts "setting hostname"
+      self.run_cmd("hostnamectl set-hostname #{new_hostname}")
+
+      STDOUT.puts "updating hostname in /etc/hosts"
+      self.run_cmd("sed -i -e 's/#{old_hostname}/#{new_hostname}/g' /etc/hosts")
+
+      STDOUT.puts "updating hostname in foreman installer scenarios"
+      self.run_cmd("sed -i -e 's/#{old_hostname}/#{new_hostname}/g' /etc/foreman-installer/scenarios.d/*.yaml")
+    end
+
     def run
       raise 'Must run as root' unless Process.uid == 0
 
@@ -255,10 +290,7 @@ module KatelloUtilities
         end
       end
 
-      STDOUT.puts "updating hostname in /etc/hostname"
-      self.run_cmd("sed -i -e 's/#{@old_hostname}/#{@new_hostname}/g' /etc/hostname")
-      STDOUT.puts "setting hostname"
-      self.run_cmd("hostnamectl set-hostname #{@new_hostname}")
+      self.update_system_hostname(@old_hostname, @new_hostname)
 
       # override environment variable (won't be updated until bash login)
       ENV['HOSTNAME'] = @new_hostname
@@ -273,6 +305,9 @@ module KatelloUtilities
 
       public_dir = "/var/www/html/pub"
       public_backup_dir = "#{public_dir}/#{@old_hostname}-#{self.timestamp}.backup"
+
+#      run_cmd("tar --selinux --create --gzip --file=#{File.join(@dir, 'config_files.tar.gz')}#{configure_configs.join(' ')} 2>/dev/null", [0,2])
+
       STDOUT.puts "deleting old certs"
 
       self.run_cmd("rm -rf /etc/pki/katello-certs-tools{,.bak}")
@@ -294,14 +329,8 @@ module KatelloUtilities
       end
 
       STDOUT.puts "backed up #{public_dir} to #{public_backup_dir}"
-      STDOUT.puts "updating hostname in /etc/hosts"
-      self.run_cmd("sed -i -e 's/#{@old_hostname}/#{@new_hostname}/g' /etc/hosts")
-
-      STDOUT.puts "updating hostname in foreman installer scenarios"
-      self.run_cmd("sed -i -e 's/#{@old_hostname}/#{@new_hostname}/g' /etc/foreman-installer/scenarios.d/*.yaml")
-
-      STDOUT.puts "removing last_scenario.yml file"
-      self.run_cmd("rm -rf /etc/foreman-installer/scenarios.d/last_scenario.yaml")
+      STDOUT.puts "removing last_scenario.yaml file"
+      self.run_cmd("rm -rf #{@scenarios_location + 'last_scenario.yaml'}")
 
       STDOUT.puts "re-running the installer"
 
@@ -328,7 +357,9 @@ module KatelloUtilities
       if installer_success
         self.successful_hostname_change_message
       else
-        self.fail_with_message("Something went wrong with the #{@options[:scenario].capitalize} installer! Please check the above output and the corresponding logs")
+        self.fail_with_message("Something went wrong with the #{@options[:scenario].capitalize} installer! " \
+                               "Please check the above output and corresponding logs. You can fix what went wrong " \
+                               "and re-run the installer to complete the hostname change.")
       end
     end
   end

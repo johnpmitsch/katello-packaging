@@ -1,3 +1,8 @@
+class String
+  def red;            "\e[31m#{self}\e[0m" end
+  def green;          "\e[32m#{self}\e[0m" end
+end
+
 module KatelloUtilities
   module Helper
     def last_scenario
@@ -33,8 +38,8 @@ module KatelloUtilities
       result = `#{command}`
       unless exit_codes.include?($?.exitstatus)
         STDOUT.puts result
-        STDOUT.puts message if message
-        failed_command = "Failed '#{command}' with exit code #{$?.exitstatus}"
+        STDOUT.puts message.red if message
+        failed_command = "Failed '#{command}' with exit code #{$?.exitstatus}".red
         if self.respond_to? :cleanup
           STDOUT.puts failed_command
           cleanup($?.exitstatus)
